@@ -2,6 +2,8 @@ import sys
 import os
 import re
 import requests
+import zipfile
+import tempfile
 
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
@@ -145,6 +147,154 @@ def get_commit_info(host: str, owner: str, repo: str, commit_sha: str, token: st
         "head_sha": current_sha,
         "title": title,
     }
+
+
+def get_pr_changed_files(host: str, owner: str, repo: str, pr_number: str, token: str = ""):
+    """
+    GitHub API를 사용하여 PR에서 실제로 변경된 파일 목록 가져오기
+    """
+    # GitHub.com 과 Enterprise API 엔드포인트 분기
+    if host == "github.com":
+        api_url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/files"
+    else:
+        # GitHub Enterprise: https://<HOST>/api/v3/...
+        api_url = f"https://{host}/api/v3/repos/{owner}/{repo}/pulls/{pr_number}/files"
+
+    headers = {
+        "Accept": "application/vnd.github.v3+json",
+    }
+    if token:
+        headers["Authorization"] = f"token {token}"
+
+    resp = requests.get(api_url, headers=headers)
+    if resp.status_code != 200:
+        raise RuntimeError(f"GitHub API 요청 실패 (status={resp.status_code})\n{resp.text}")
+
+    files_data = resp.json()
+    
+    # 변경된 파일 경로 목록 (추가, 수정, 이름 변경 포함, 삭제 제외)
+    changed_filepaths = set()
+    for file_data in files_data:
+        status = file_data.get("status", "")
+        filename = file_data.get("filename", "")
+        previous_filename = file_data.get("previous_filename")
+        
+        # 삭제된 파일은 제외
+        if status != "removed":
+            changed_filepaths.add(filename)
+            # 이름이 변경된 경우 이전 파일명도 포함
+            if previous_filename:
+                changed_filepaths.add(previous_filename)
+    
+    return list(changed_filepaths)
+
+
+def extract_changed_files_from_zip(zip_path: str, changed_filepaths: set, output_dir: str, 
+                                   log_widget: QPlainTextEdit = None):
+    """
+    ZIP 아카이브에서 변경된 파일들만 추출
+    """
+    extracted_count = 0
+    try:
+        with zipfile.ZipFile(zip_path, 'r') as zipf:
+            # ZIP 내부의 루트 디렉토리 찾기 (보통 REPO-SHA 형식)
+            namelist = zipf.namelist()
+            if not namelist:
+                return extracted_count
+            
+            # 첫 번째 파일의 경로에서 루트 디렉토리 추출
+            root_dir = namelist[0].split('/')[0] + '/'
+            
+            for filepath in changed_filepaths:
+                # ZIP 내부 경로 구성 (REPO-SHA/파일경로)
+                zip_internal_path = root_dir + filepath
+                
+                # 정확한 경로로 시도
+                if zip_internal_path in namelist:
+                    # 파일 추출
+                    extracted_filepath = os.path.join(output_dir, filepath)
+                    os.makedirs(os.path.dirname(extracted_filepath), exist_ok=True)
+                    
+                    with zipf.open(zip_internal_path) as source, open(extracted_filepath, 'wb') as target:
+                        target.write(source.read())
+                    extracted_count += 1
+                else:
+                    # 대소문자 무시하여 찾기
+                    found = False
+                    for zip_path_internal in namelist:
+                        # 루트 디렉토리 제거 후 비교
+                        relative_path = zip_path_internal[len(root_dir):] if zip_path_internal.startswith(root_dir) else zip_path_internal
+                        if relative_path.lower() == filepath.lower() or relative_path.replace('\\', '/') == filepath.replace('\\', '/'):
+                            extracted_filepath = os.path.join(output_dir, filepath)
+                            os.makedirs(os.path.dirname(extracted_filepath), exist_ok=True)
+                            
+                            with zipf.open(zip_path_internal) as source, open(extracted_filepath, 'wb') as target:
+                                target.write(source.read())
+                            extracted_count += 1
+                            found = True
+                            break
+                    
+                    if not found and log_widget:
+                        log_append(log_widget, f"[!] 파일을 찾을 수 없음: {filepath}")
+    except Exception as e:
+        if log_widget:
+            log_append(log_widget, f"[!] ZIP 추출 오류: {str(e)}")
+    
+    return extracted_count
+
+
+def create_filtered_zip_from_archives(base_zip_path: str, head_zip_path: str, 
+                                     changed_filepaths: set, output_zip_path: str,
+                                     log_widget: QPlainTextEdit, progress_bar: QProgressBar):
+    """
+    base와 head ZIP에서 변경된 파일들만 추출하여 새로운 ZIP 생성
+    """
+    temp_dir = tempfile.mkdtemp()
+    base_dir = os.path.join(temp_dir, "before")
+    head_dir = os.path.join(temp_dir, "after")
+    os.makedirs(base_dir, exist_ok=True)
+    os.makedirs(head_dir, exist_ok=True)
+
+    try:
+        log_append(log_widget, f"[*] base ZIP에서 변경된 파일 {len(changed_filepaths)}개 추출 중...")
+        progress_bar.setValue(25)
+        QApplication.processEvents()
+        extract_changed_files_from_zip(base_zip_path, changed_filepaths, base_dir, log_widget)
+
+        log_append(log_widget, f"[*] head ZIP에서 변경된 파일 {len(changed_filepaths)}개 추출 중...")
+        progress_bar.setValue(50)
+        QApplication.processEvents()
+        extract_changed_files_from_zip(head_zip_path, changed_filepaths, head_dir, log_widget)
+
+        log_append(log_widget, "[*] 필터링된 ZIP 파일 생성 중...")
+        progress_bar.setValue(75)
+        QApplication.processEvents()
+
+        # 새 ZIP 파일 생성
+        with zipfile.ZipFile(output_zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+            # before 파일들 추가
+            for root, dirs, files in os.walk(base_dir):
+                for file in files:
+                    file_path = os.path.join(root, file)
+                    arcname = os.path.relpath(file_path, base_dir)
+                    zipf.write(file_path, f"before/{arcname}")
+
+            # after 파일들 추가
+            for root, dirs, files in os.walk(head_dir):
+                for file in files:
+                    file_path = os.path.join(root, file)
+                    arcname = os.path.relpath(file_path, head_dir)
+                    zipf.write(file_path, f"after/{arcname}")
+
+        log_append(log_widget, f"[+] 필터링된 ZIP 파일 생성 완료: {output_zip_path}")
+
+    finally:
+        # 임시 디렉토리 정리
+        import shutil
+        try:
+            shutil.rmtree(temp_dir)
+        except:
+            pass
 
 
 def download_zip(archive_url: str, out_path: str, token: str,
@@ -344,7 +494,7 @@ class PRDownloaderGUI(QWidget):
         base_short = base_sha[:7]
         head_short = head_sha[:7]
         base_filename = f"{base_repo_full.replace('/', '_')}_{identifier}_before_{base_short}.zip"
-        head_filename = f"{head_repo_full.replace('/', '_')}_{identifier}_after_{head_short}.zip"
+        head_filename = f"{base_repo_full.replace('/', '_')}_{identifier}_after_{head_short}.zip"
 
         # 🔥 ZIP 저장 위치 = 자동 생성 폴더
         base_out_path = os.path.join(auto_folder, base_filename)
@@ -354,15 +504,71 @@ class PRDownloaderGUI(QWidget):
             self.download_btn.setEnabled(False)
             QApplication.setOverrideCursor(Qt.WaitCursor)
 
-            # before 다운로드
-            self.progress_bar.setValue(0)
-            log_append(self.log_output, "[*] 변경 전(before) ZIP 다운로드 중...")
-            download_zip(base_archive_url, base_out_path, token, self.log_output, self.progress_bar)
+            if is_pr_url:
+                # PR인 경우: 변경된 파일만 필터링하여 다운로드
+                log_append(self.log_output, "[*] PR에서 변경된 파일 목록 조회 중...")
+                changed_filepaths = set(get_pr_changed_files(host, owner, repo, pr_number, token))
+                log_append(self.log_output, f"[+] 변경된 파일 {len(changed_filepaths)}개 발견")
 
-            # after 다운로드
-            self.progress_bar.setValue(0)
-            log_append(self.log_output, "[*] 변경 후(after) ZIP 다운로드 중...")
-            download_zip(head_archive_url, head_out_path, token, self.log_output, self.progress_bar)
+                # 임시로 전체 ZIP 다운로드
+                temp_base_zip = os.path.join(tempfile.gettempdir(), f"temp_base_{base_sha[:7]}.zip")
+                temp_head_zip = os.path.join(tempfile.gettempdir(), f"temp_head_{head_sha[:7]}.zip")
+
+                try:
+                    # before 다운로드
+                    self.progress_bar.setValue(0)
+                    log_append(self.log_output, "[*] base ZIP 다운로드 중...")
+                    download_zip(base_archive_url, temp_base_zip, token, self.log_output, self.progress_bar)
+
+                    # after 다운로드
+                    self.progress_bar.setValue(0)
+                    log_append(self.log_output, "[*] head ZIP 다운로드 중...")
+                    download_zip(head_archive_url, temp_head_zip, token, self.log_output, self.progress_bar)
+
+                    # 필터링된 ZIP 생성
+                    filtered_zip_path = os.path.join(auto_folder, f"{base_repo_full.replace('/', '_')}_{identifier}_changed_files.zip")
+                    create_filtered_zip_from_archives(
+                        temp_base_zip, temp_head_zip, changed_filepaths, 
+                        filtered_zip_path, self.log_output, self.progress_bar
+                    )
+
+                    # 원본 전체 ZIP도 저장
+                    base_out_path = os.path.join(auto_folder, base_filename)
+                    head_out_path = os.path.join(auto_folder, head_filename)
+                    
+                    import shutil
+                    shutil.copy2(temp_base_zip, base_out_path)
+                    shutil.copy2(temp_head_zip, head_out_path)
+
+                    final_base_path = base_out_path
+                    final_head_path = head_out_path
+                    final_filtered_path = filtered_zip_path
+
+                finally:
+                    # 임시 파일 정리 (이미 이동했으면 존재하지 않음)
+                    import shutil
+                    for temp_file in [temp_base_zip, temp_head_zip]:
+                        if os.path.exists(temp_file):
+                            try:
+                                os.remove(temp_file)
+                            except:
+                                pass
+
+            else:
+                # 커밋인 경우: 기존 방식 (전체 ZIP 다운로드)
+                # before 다운로드
+                self.progress_bar.setValue(0)
+                log_append(self.log_output, "[*] 변경 전(before) ZIP 다운로드 중...")
+                download_zip(base_archive_url, base_out_path, token, self.log_output, self.progress_bar)
+
+                # after 다운로드
+                self.progress_bar.setValue(0)
+                log_append(self.log_output, "[*] 변경 후(after) ZIP 다운로드 중...")
+                download_zip(head_archive_url, head_out_path, token, self.log_output, self.progress_bar)
+
+                final_base_path = base_out_path
+                final_head_path = head_out_path
+                final_filtered_path = None
 
         except Exception as e:
             QMessageBox.critical(self, "다운로드 오류", str(e))
@@ -373,12 +579,21 @@ class PRDownloaderGUI(QWidget):
             QApplication.restoreOverrideCursor()
             self.progress_bar.setValue(100)
 
-        msg = (
-            "다운로드 완료!\n\n"
-            f"- 저장 폴더: {auto_folder}\n"
-            f"- 변경 전(before): {base_out_path}\n"
-            f"- 변경 후(after): {head_out_path}"
-        )
+        if is_pr_url:
+            msg = (
+                "다운로드 완료!\n\n"
+                f"- 저장 폴더: {auto_folder}\n"
+                f"- 변경된 파일만 포함: {final_filtered_path}\n"
+                f"- 전체 base ZIP: {final_base_path}\n"
+                f"- 전체 head ZIP: {final_head_path}"
+            )
+        else:
+            msg = (
+                "다운로드 완료!\n\n"
+                f"- 저장 폴더: {auto_folder}\n"
+                f"- 변경 전(before): {final_base_path}\n"
+                f"- 변경 후(after): {final_head_path}"
+            )
         QMessageBox.information(self, "완료", msg)
         log_append(self.log_output, "\n✅ 모든 작업 완료")
 
